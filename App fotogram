@@ -1,0 +1,153 @@
+import os
+from kivy.app import App
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.progressbar import ProgressBar
+from kivy.clock import Clock
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import exifread, piexif
+from pyproj import CRS, Transformer
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Funciones de coordenadas
+# -------------------------
+def latlon_to_utm(lat, lon):
+    zone = int((lon + 180) / 6) + 1
+    utm_crs = CRS.from_user_input(f"+proj=utm +zone={zone} +datum=WGS84 +units=m +no_defs")
+    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    e, n = transformer.transform(lon, lat)
+    return e, n, zone
+
+def latlon_to_ecef(lat, lon, alt):
+    transformer = Transformer.from_crs("EPSG:4979", "EPSG:4978", always_xy=True)
+    x, y, z = transformer.transform(lon, lat, alt)
+    return x, y, z
+
+# -------------------------
+# Escribir EXIF GPS
+# -------------------------
+def write_gps_exif(image_path, lat, lon, alt):
+    def to_deg(value, ref):
+        d = int(abs(value))
+        m = int((abs(value)-d)*60)
+        s = round(((abs(value)-d)*60-m)*60*10000)
+        return ((d,1),(m,1),(s,10000)), ref
+    lat_ref = 'N' if lat>=0 else 'S'
+    lon_ref = 'E' if lon>=0 else 'W'
+    lat_deg, lon_deg = to_deg(lat, lat_ref), to_deg(lon, lon_ref)
+    exif_dict = {"GPS":{
+        piexif.GPSIFD.GPSLatitudeRef: lat_deg[1],
+        piexif.GPSIFD.GPSLatitude: lat_deg[0],
+        piexif.GPSIFD.GPSLongitudeRef: lon_deg[1],
+        piexif.GPSIFD.GPSLongitude: lon_deg[0],
+        piexif.GPSIFD.GPSAltitudeRef:0,
+        piexif.GPSIFD.GPSAltitude:(int(alt*100),100)
+    }}
+    try:
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, image_path)
+    except:
+        pass
+
+# -------------------------
+# Histograma errores
+# -------------------------
+def plot_errors(df):
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1)
+    plt.hist(df['time_error_sec'], bins=20)
+    plt.title("Error temporal (s)")
+    plt.subplot(1,2,2)
+    plt.hist(df['spatial_error_m'], bins=20)
+    plt.title("Error espacial (m)")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# App Kivy
+# -------------------------
+class RTKApp(App):
+    def build(self):
+        self.title = "RTK Fotogrametría S&E"
+        layout = BoxLayout(orientation='vertical',padding=10,spacing=10)
+        layout.add_widget(Label(text="RTK-Fotogrametría PRO",font_size=20))
+        self.folder_btn = Button(text="Seleccionar carpeta de fotos")
+        self.folder_btn.bind(on_press=self.select_folder)
+        layout.add_widget(self.folder_btn)
+        self.file_btn = Button(text="Seleccionar archivo RTK (.csv)")
+        self.file_btn.bind(on_press=self.select_file)
+        layout.add_widget(self.file_btn)
+        self.progress = ProgressBar(max=100)
+        layout.add_widget(self.progress)
+        self.run_btn = Button(text="▶ Iniciar procesamiento")
+        self.run_btn.bind(on_press=self.start_processing)
+        layout.add_widget(self.run_btn)
+        self.status = Label(text="")
+        layout.add_widget(self.status)
+        return layout
+
+    def select_folder(self,instance):
+        # Aquí se puede integrar un selector de carpetas si se usa plyer
+        self.photo_folder = "/storage/emulated/0/DCIM/"  # ejemplo predeterminado
+        self.status.text = f"Carpeta fotos: {self.photo_folder}"
+
+    def select_file(self,instance):
+        self.rtk_file = "/storage/emulated/0/Download/rtk_log.csv"  # ejemplo predeterminado
+        self.status.text = f"Archivo RTK: {self.rtk_file}"
+
+    def start_processing(self,instance):
+        Clock.schedule_once(self.process_data,0)
+
+    def process_data(self,dt):
+        self.status.text = "Procesando..."
+        df_rtk = pd.read_csv(self.rtk_file)
+        df_rtk.columns = [c.strip().lower() for c in df_rtk.columns]
+        time_col = [c for c in df_rtk.columns if 'time' in c][0]
+        lat_col = [c for c in df_rtk.columns if 'lat' in c][0]
+        lon_col = [c for c in df_rtk.columns if 'lon' in c][0]
+        alt_col = [c for c in df_rtk.columns if 'alt' in c or 'height' in c][0]
+        df_rtk['datetime'] = df_rtk[time_col].apply(lambda x: datetime.strptime(str(x).strip(),"%Y-%m-%d %H:%M:%S"))
+
+        photos=[]
+        for fname in os.listdir(self.photo_folder):
+            if fname.lower().endswith(('.jpg','.jpeg','.tif','.tiff')):
+                dt_img=None
+                try:
+                    with open(os.path.join(self.photo_folder,fname),'rb') as f:
+                        tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal")
+                        dt_img = datetime.strptime(str(tags.get("EXIF DateTimeOriginal")),"%Y:%m:%d %H:%M:%S")
+                except: pass
+                if dt_img: photos.append({'filename':fname,'datetime':dt_img})
+        df_photos = pd.DataFrame(photos)
+
+        matched=[]
+        for i,row in df_photos.iterrows():
+            t = row['datetime']
+            diffs = df_rtk['datetime'].apply(lambda x: abs((x-t).total_seconds()))
+            idx = diffs.idxmin()
+            min_diff = diffs.min()
+            if min_diff<=2:
+                lat = df_rtk.loc[idx,lat_col]
+                lon = df_rtk.loc[idx,lon_col]
+                alt = df_rtk.loc[idx,alt_col]
+                e,n,zone = latlon_to_utm(lat,lon)
+                X,Y,Z = latlon_to_ecef(lat,lon,alt)
+                spatial_err = 0
+                write_gps_exif(os.path.join(self.photo_folder,row['filename']),lat,lon,alt)
+                matched.append({'filename':row['filename'],'datetime_photo':row['datetime'],
+                                'datetime_corrected':t,'time_error_sec':min_diff,'offset_applied_sec':0,
+                                'lat':lat,'lon':lon,'alt':alt,'utm_easting':e,'utm_northing':n,
+                                'utm_zone':zone,'ecef_x':X,'ecef_y':Y,'ecef_z':Z,'spatial_error_m':spatial_err})
+            self.progress.value = (i+1)/len(df_photos)*100
+
+        df_matched = pd.DataFrame(matched)
+        df_matched.to_csv(os.path.join(self.photo_folder,"matched_photos_XYZ_corrected.csv"),index=False)
+        plot_errors(df_matched)
+        self.status.text="✅ Proceso completado"
+
+if __name__=="__main__":
+    RTKApp().run()
